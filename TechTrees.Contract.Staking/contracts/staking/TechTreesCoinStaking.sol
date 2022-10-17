@@ -8,22 +8,25 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 contract TechTreesCoinStaking is Ownable {
     using SafeERC20 for IERC20;
 
+    event PoolAdded(address indexed operator, uint256 flags, uint256 factor, uint256 feeFreePeriod, uint256 lockPeriod);
     event Deposit(address indexed account, uint256 indexed poolId, uint256 value);
     event Withdraw(address indexed account, uint256 indexed poolId, uint256 value);
     event WithdrawPendingTokens(address indexed account, uint256 points, uint256 value);
     event EmergencyWithdraw(address indexed account, uint256 value);
 
+    event Start(address indexed operator, uint256 powEndBlock);
+    event StakingParameterChanged(address indexed operator, uint256 totalInjectedTokens, uint256 powTokensPerBlock, uint256 pointsPerBlock);
+    event StakingInternalParameterChanged(address indexed operator, uint256 lastUpdateBlock, uint256 accTokensPerShare, uint256 accPointsPerEther);
+
+    // TTC-10 remove unnecessary variables
     uint256 private constant fPoint = 1 << 0;
     uint256 private constant fTTC = 1 << 1;
     uint256 private constant fObsolete = 1 << 2;
     uint256 private constant blocksPerday = 20 * 60 * 24;
-    uint256 private constant feeFreeBlocks = blocksPerday * 7;
     uint256 private constant sqrt1EtherFBase = 1e10;
-    uint256 private constant oneEther = 1 ether;
     uint256 private constant feePercentage = 95;
     uint256 private constant factorBase = 100;
     uint256 private constant acc1e12 = 1e12;
-    address private constant zeroAddress = address(0x0);
 
     struct Pool {
         uint8 flags;
@@ -44,20 +47,20 @@ contract TechTreesCoinStaking is Ownable {
     bool public emergency;
     uint216 public accTokensPerShare;
     uint32 public lastUpdateBlock;
+    // 256 bits
     uint32 public powEndBlock;
     uint96 public powTokensPerBlock;
     uint128 public powShareTotal;
-
+    // 256 bits
     uint256 public totalStaked;
     uint256 public totalInjectedTokens;
 
     uint96 public pointsPerBlock;
     uint160 public accPointsPerEther;
+    // 256 bits
 
     // pool => account => value
     mapping(address => mapping(uint256 => StakedShare)) private _userStakes;
-    // account => withdraw
-    mapping(address => bool) public emergencyWithdrawal;
 
     Pool[] public pools;
 
@@ -82,48 +85,59 @@ contract TechTreesCoinStaking is Ownable {
         pools.push(Pool({flags: uint8(fPoint | fTTC), factor: 400, feeFreePeriod: 0, lockPeriod: uint32(blocksPerday * 120), totalStake: 0}));
     }
 
-    function initTokens(
+    // can be done multiply time before started
+    function injectPowTokensBeforeStart(
         uint256 powTokens,
         uint256 powTokensPerBlock_,
         uint256 pointsPerblock_
-    ) external onlyOwner {
-        require(lastUpdateBlock == 0, "already inited");
+    ) external nonStarted onlyOwner {
         ttCoin.safeTransferFrom(msg.sender, address(this), powTokens);
         totalInjectedTokens += powTokens;
         powTokensPerBlock = uint96(powTokensPerBlock_);
         pointsPerBlock = uint96(pointsPerblock_);
+        emit StakingParameterChanged(msg.sender, totalInjectedTokens, powTokensPerBlock, pointsPerBlock);
     }
 
-    function start() external onlyOwner {
-        require(lastUpdateBlock == 0, "already inited");
-        require(totalInjectedTokens > 0, "not enought injection tokens");
+    function start() external onlyOwner nonStarted {
+        // make sure the contract has been injected enought tokens for staking
+        require(totalInjectedTokens > 0, "not enought pow tokens");
+        // confirm staking end block
         powEndBlock = uint32(block.number + totalInjectedTokens / powTokensPerBlock);
+        // set last update block to current block
         lastUpdateBlock = uint32(block.number);
+        emit Start(msg.sender, powEndBlock);
     }
 
-    function setPowTokensPerBlock(uint256 powTokensPerBlock_) external onlyOwner {
-        require(lastUpdateBlock > 0, "not started");
+    // can be called after staking is started in order to adjust dispatch ratio
+    // it will change the end time of staking proceduce
+    function setPowTokensPerBlock(uint256 powTokensPerBlock_) external started onlyOwner {
         require(powEndBlock > block.number, "already ended");
         _updateStakingParameter();
         uint256 restToken = (uint256(powEndBlock) - block.number) * powTokensPerBlock;
         powEndBlock = uint32(block.number + restToken / powTokensPerBlock_);
         powTokensPerBlock = uint96(powTokensPerBlock_);
+        emit StakingParameterChanged(msg.sender, totalInjectedTokens, powTokensPerBlock, pointsPerBlock);
     }
 
-    function setPointsPerBlock(uint256 pointsPerBlock_) external onlyOwner {
+    // can be called after staking is started in order to adjust dispatch ratio
+    function setPointsPerBlock(uint256 pointsPerBlock_) external started onlyOwner {
         require(lastUpdateBlock > 0, "not started");
         require(powEndBlock > block.number, "already ended");
         _updateStakingParameter();
         pointsPerBlock = uint96(pointsPerBlock_);
+        emit StakingParameterChanged(msg.sender, totalInjectedTokens, powTokensPerBlock, pointsPerBlock);
     }
 
-    function addPowTokens(uint256 powTokens) external onlyOwner {
+    // can be called after staking is started in order to add more dispatchable tokens
+    // it will change the end time of staking proceduce
+    function addPowTokens(uint256 powTokens) external started onlyOwner {
         require(powEndBlock > block.number, "already ended");
         _updateStakingParameter();
         ttCoin.safeTransferFrom(msg.sender, address(this), powTokens);
         totalInjectedTokens += powTokens;
         uint256 restToken = (uint256(powEndBlock) - block.number) * powTokensPerBlock + powTokens;
         if (lastUpdateBlock > 0) powEndBlock = uint32(block.number + restToken / powTokensPerBlock);
+        emit StakingParameterChanged(msg.sender, totalInjectedTokens, powTokensPerBlock, pointsPerBlock);
     }
 
     function restInjectedTokens() public view returns (uint256) {
@@ -142,50 +156,64 @@ contract TechTreesCoinStaking is Ownable {
         uint32 lockPeriod
     ) external onlyOwner {
         pools.push(Pool({flags: flags, factor: factor, feeFreePeriod: feeFreePeriod, lockPeriod: lockPeriod, totalStake: 0}));
+        emit PoolAdded(msg.sender, flags, factor, feeFreePeriod, lockPeriod);
     }
 
     function poolCount() external view returns (uint256 count) {
         return pools.length;
     }
 
-    function deposit(uint256 pId, uint256 value) external validPool(pId) {
+    // deposit
+    function deposit(uint256 pId, uint256 value) external nonEmergency validPool(pId) {
         require(value > 0, "empty deposit is not allowed");
+        // transfer-in tokens
         ttCoin.safeTransferFrom(msg.sender, address(this), value);
+
+        // withdraw pending tokens(if any) then update global staking parameters
         (uint256 _accTokensPerShare, uint256 _accPointsPerEther) = _withdrawSinglePending(msg.sender, pId);
+        powShareTotal += uint128((value * pools[pId].factor) / factorBase);
+        totalStaked += value;
+
+        // update user's staking parameters
         StakedShare storage stakedShare = _userStakes[msg.sender][pId];
         stakedShare.amount += uint96(value);
         stakedShare.lastDepositBlock = uint32(block.number);
-        powShareTotal += uint128((value * pools[pId].factor) / factorBase);
+        // recalculate the reward debt of points and tokens
         uint256 userStakeFactor = uint256(stakedShare.amount) * pools[pId].factor;
         stakedShare.powRewardDebt = uint128((userStakeFactor * _accTokensPerShare) / (factorBase * acc1e12));
         stakedShare.pointRewardDebt = uint128((sqrt(userStakeFactor) * _accPointsPerEther) / sqrt1EtherFBase);
-        totalStaked += value;
+
         emit Deposit(msg.sender, pId, value);
     }
 
-    function withdraw(uint256 pId, uint256 value) external {
+    function withdraw(uint256 pId, uint256 value) external nonEmergency {
         require(value > 0, "empty withdraw is not allowed");
-        require(!emergency, "cannot withdraw under emergency");
-        (uint256 _accTokensPerShare, uint256 _accPointsPerEther) = _withdrawSinglePending(msg.sender, pId);
+        // check prerequirement
         StakedShare storage stakedShare = _userStakes[msg.sender][pId];
         require(value <= stakedShare.amount, "not enough to withdraw");
         require(block.number >= stakedShare.lastDepositBlock + pools[pId].lockPeriod, "not reach withdraw block");
 
-        stakedShare.amount -= uint96(value);
-        uint256 _powShare = (value * pools[pId].factor) / factorBase;
-        powShareTotal -= uint128(_powShare);
+        // withdraw pending tokens(if any) then update global staking parameters
+        (uint256 _accTokensPerShare, uint256 _accPointsPerEther) = _withdrawSinglePending(msg.sender, pId);
+        powShareTotal -= uint128((value * pools[pId].factor) / factorBase);
+        totalStaked -= value;
 
+        // update user's staking parameters
+        stakedShare.amount -= uint96(value);
         uint256 userStakeFactor = uint256(stakedShare.amount) * pools[pId].factor;
         stakedShare.powRewardDebt = uint128((userStakeFactor * _accTokensPerShare) / (factorBase * acc1e12));
         stakedShare.pointRewardDebt = (sqrt(userStakeFactor) * _accPointsPerEther) / sqrt1EtherFBase;
 
+        // transfer-out withdraw tokens
+        // the penalty fee will be taken under some situation
         if (block.number < stakedShare.lastDepositBlock + pools[pId].feeFreePeriod) ttCoin.safeTransfer(msg.sender, (value * feePercentage) / factorBase);
         else ttCoin.safeTransfer(msg.sender, value);
-        totalStaked -= value;
+
         emit Withdraw(msg.sender, pId, value);
     }
 
-    function withdrawAllPending() external {
+    // do a loop to withdraw all pending tokens
+    function withdrawAllPending() external nonEmergency {
         uint256 points;
         uint256 tokens;
         uint256 _poolCount = pools.length;
@@ -197,7 +225,7 @@ contract TechTreesCoinStaking is Ownable {
         _withdrawTransfer(msg.sender, points, tokens);
     }
 
-    function withdrawPending(uint256 pId) external {
+    function withdrawPending(uint256 pId) external nonEmergency {
         _withdrawSinglePending(msg.sender, pId);
     }
 
@@ -218,16 +246,20 @@ contract TechTreesCoinStaking is Ownable {
         )
     {
         uint256 minBlock;
-        (_accTokensPerShare, _accPointsPerEther, minBlock) = _updateStakingParameter();
         StakedShare storage _stakeShare = _userStakes[account][pId];
         uint256 userStakeFactor = _stakeShare.amount * pools[pId].factor;
+        // if user has some staking values
         if (userStakeFactor > 0) {
+            // update global staking parameters
+            (_accTokensPerShare, _accPointsPerEther, minBlock) = _updateStakingParameter();
             if ((pools[pId].flags & fPoint) > 0) {
+                // points pending calculation
                 uint256 _pending = (sqrt(userStakeFactor) * _accPointsPerEther) / sqrt1EtherFBase;
                 points = _pending - _stakeShare.pointRewardDebt;
                 _stakeShare.pointRewardDebt = _pending;
             }
             if ((pools[pId].flags & fTTC) > 0) {
+                // token pending calculation
                 uint256 _pending = (userStakeFactor * _accTokensPerShare) / (factorBase * acc1e12);
                 tokens = _pending - _stakeShare.powRewardDebt;
                 _stakeShare.powRewardDebt = uint128(_pending);
@@ -246,6 +278,7 @@ contract TechTreesCoinStaking is Ownable {
         if (points > 0 || tokens > 0) emit WithdrawPendingTokens(to, points, tokens);
     }
 
+    // fixes for TCK-01 emit events when internal parameter changes
     function _updateStakingParameter()
         private
         returns (
@@ -256,31 +289,48 @@ contract TechTreesCoinStaking is Ownable {
     {
         _accTokensPerShare = accTokensPerShare;
         _accPointsPerEther = accPointsPerEther;
+        // get the minor block of current block and staking end block to avoid the overflow of token dispatching
         minBlock = min(block.number, powEndBlock);
+        // make sure staking is started and not yet finished
         if (lastUpdateBlock > 0 && minBlock > lastUpdateBlock) {
             uint256 diffBlocks = minBlock - lastUpdateBlock;
+            // accumulate points
             _accPointsPerEther += diffBlocks * pointsPerBlock;
             accPointsPerEther = uint160(_accPointsPerEther);
+            // update last update blocks
             lastUpdateBlock = uint32(minBlock);
             if (powShareTotal > 0) {
+                // accumulate token dispatching parameters
                 uint256 diff = powTokensPerBlock * diffBlocks;
                 _accTokensPerShare += (diff * acc1e12) / powShareTotal;
                 accTokensPerShare = uint216(_accTokensPerShare);
             }
+            // emit event
+            emit StakingInternalParameterChanged(msg.sender, minBlock, _accTokensPerShare, _accPointsPerEther);
         }
     }
 
-    function emergencyWithdraw(uint256 pId) external {
-        require(emergency && !emergencyWithdrawal[msg.sender], "already withdraw");
-        emergencyWithdrawal[msg.sender] = true;
+    // fixes for TTC-04
+    function emergencyWithdraw(uint256 pId) external underEmergency {
+        require(emergency, "not in emergency");
         uint256 _poolCount = pools.length;
         uint256 value;
-        for (uint256 index = 0; index < _poolCount; ++index) value += _userStakes[msg.sender][pId].amount;
-        ttCoin.safeTransfer(msg.sender, value);
-        totalStaked -= value;
-        emit EmergencyWithdraw(msg.sender, value);
+        for (uint256 index = 0; index < _poolCount; ++index) {
+            uint256 oneAmount = _userStakes[msg.sender][pId].amount;
+            if (oneAmount > 0) {
+                // in case of emergency withdraw, modify deposited values
+                value += oneAmount;
+                _userStakes[msg.sender][pId].amount = 0;
+            }
+        }
+        if (value > 0) {
+            ttCoin.safeTransfer(msg.sender, value);
+            totalStaked -= value;
+            emit EmergencyWithdraw(msg.sender, value);
+        }
     }
 
+    // get user withdrawable tokens and point, base on _withdrawPending() algorithm, view only
     function pending(address account, uint256 pId) public view returns (uint256 points, uint256 tokens) {
         StakedShare storage _stakeShare = _userStakes[account][pId];
         uint256 userStakeFactor = _stakeShare.amount * pools[pId].factor;
@@ -349,6 +399,26 @@ contract TechTreesCoinStaking is Ownable {
 
     modifier validPool(uint256 pId) {
         require((pools[pId].flags & fObsolete) == 0, "pool is obsolete");
+        _;
+    }
+
+    modifier started() {
+        require(lastUpdateBlock > 0, "not started");
+        _;
+    }
+
+    modifier nonStarted() {
+        require(lastUpdateBlock > 0, "not started");
+        _;
+    }
+
+    modifier nonEmergency() {
+        require(!emergency, "cannot perform under emergency");
+        _;
+    }
+
+    modifier underEmergency() {
+        require(emergency, "only under emergency");
         _;
     }
 }
