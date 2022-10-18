@@ -408,7 +408,7 @@ contract TechTreesCoinStaking is Ownable {
     }
 
     modifier nonStarted() {
-        require(lastUpdateBlock > 0, "not started");
+        require(lastUpdateBlock == 0, "already started");
         _;
     }
 
